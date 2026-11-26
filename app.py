@@ -4,7 +4,8 @@ import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Brilla Aseo - Inventario", page_icon="🧹", layout="wide")
+ICONO_BRILLA_ASEO = "🌿"
+st.set_page_config(page_title="Brilla Aseo - Inventario", page_icon=ICONO_BRILLA_ASEO, layout="wide")
 
 DB_PATH = "siga_clase.db"
 
@@ -180,7 +181,7 @@ def registrar_salida(id_producto, cantidad, tipo, fecha_movimiento, observacion)
         return False, f"No se pudo registrar la salida: {error}"
 
 
-st.title("Brilla Aseo - Sistema de inventario")
+st.title(f"{ICONO_BRILLA_ASEO} Brilla Aseo - Sistema de inventario")
 st.caption("Control de productos, movimientos, existencias y alertas")
 
 datos = inventario()
