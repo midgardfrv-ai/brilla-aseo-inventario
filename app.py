@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from datetime import date
 import pandas as pd
 import streamlit as st
@@ -66,6 +67,16 @@ def crear_estructura_y_datos(conexion):
         LEFT JOIN movimientos AS m ON m.id_producto = p.id_producto
         GROUP BY p.id_producto, p.nombre, p.categoria,
                  p.unidad_medida, p.stock_minimo;
+
+        CREATE TABLE IF NOT EXISTS pedidos (
+            id_pedido INTEGER PRIMARY KEY AUTOINCREMENT,
+            tercero TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS movimientos_pedido (
+            id_movimiento INTEGER PRIMARY KEY REFERENCES movimientos(id_movimiento),
+            id_pedido INTEGER NOT NULL REFERENCES pedidos(id_pedido)
+        );
         """
     )
 
@@ -181,6 +192,50 @@ def registrar_salida(id_producto, cantidad, tipo, fecha_movimiento, observacion)
         return False, f"No se pudo registrar la salida: {error}"
 
 
+def registrar_pedido(tipo, tercero, items, fecha_movimiento, observacion):
+    """Registra un pedido y todos sus movimientos en una sola transacción."""
+    tercero = tercero.strip()
+    if tipo not in {"entrada", "salida"} or not tercero or not items:
+        return False, "Selecciona el tipo, indica el proveedor o cliente y añade productos."
+    if any(type(cantidad) is not int or cantidad <= 0 for cantidad in items.values()):
+        return False, "Todas las cantidades deben ser enteros positivos."
+
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as db:
+            db.execute("PRAGMA foreign_keys = ON")
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                for id_producto, cantidad in items.items():
+                    producto = db.execute(
+                        """SELECT p.nombre, i.stock_actual FROM productos p
+                           JOIN inventario_actual i USING (id_producto)
+                           WHERE p.id_producto = ? AND p.activo = 1""",
+                        (id_producto,),
+                    ).fetchone()
+                    if producto is None:
+                        raise ValueError("Un producto ya no está activo. Revisa el pedido.")
+                    nombre, stock = producto
+                    if tipo == "salida" and cantidad > stock:
+                        raise ValueError(f"{nombre}: hay {stock} disponibles y pediste {cantidad}.")
+
+                pedido = db.execute("INSERT INTO pedidos (tercero) VALUES (?)", (tercero,)).lastrowid
+                for id_producto, cantidad in items.items():
+                    movimiento = db.execute(
+                        """INSERT INTO movimientos (id_producto, tipo, cantidad, fecha, observacion)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (id_producto, tipo, cantidad, fecha_movimiento, observacion),
+                    ).lastrowid
+                    db.execute(
+                        "INSERT INTO movimientos_pedido (id_movimiento, id_pedido) VALUES (?, ?)",
+                        (movimiento, pedido),
+                    )
+        return True, f"Pedido #{pedido} registrado ({len(items)} productos)."
+    except ValueError as error:
+        return False, f"Pedido sin registrar. {error}"
+    except (sqlite3.Error, OverflowError):
+        return False, "No se pudo registrar el pedido. Revisa las cantidades o inténtalo de nuevo."
+
+
 st.title(f"{ICONO_BRILLA_ASEO} Brilla Aseo - Sistema de inventario")
 st.caption("Control de productos, movimientos, existencias y alertas")
 
@@ -203,27 +258,51 @@ with tab_inicio:
     st.dataframe(datos[["nombre", "categoria", "stock_actual", "stock_minimo", "estado"]], use_container_width=True, hide_index=True)
 
 with tab_registro:
-    st.subheader("Registrar movimiento")
-    productos = leer("SELECT id_producto, nombre FROM productos WHERE activo = 1 ORDER BY nombre")
-    opciones = {fila.nombre: int(fila.id_producto) for fila in productos.itertuples()}
-    with st.form("formulario_movimiento"):
-        nombre_producto = st.selectbox("Producto", list(opciones))
-        tipo_operacion = st.selectbox("Tipo", ["entrada", "salida"])
-        cantidad = st.number_input("Cantidad", min_value=1, step=1, value=1)
-        fecha_movimiento = st.date_input("Fecha", value=date.today())
-        observacion = st.text_input("Observación", placeholder="Ejemplo: compra o entrega a cliente")
-        enviar = st.form_submit_button("Guardar movimiento")
-
+    st.subheader("Registrar pedido")
+    if mensaje_guardado := st.session_state.pop("pedido_guardado", None):
+        st.success(mensaje_guardado)
+        st.session_state["productos_pedido"] = []
+    catalogo = leer("SELECT id_producto, nombre, unidad_medida FROM productos WHERE activo = 1 ORDER BY nombre")
+    nombres = {fila.id_producto: f"{fila.nombre} ({fila.unidad_medida})" for fila in catalogo.itertuples()}
+    tipo = st.radio("Tipo de pedido", ["entrada", "salida"], format_func={
+        "entrada": "Compra recibida (entrada)", "salida": "Despacho a cliente (salida)"
+    }.__getitem__, horizontal=True)
+    seleccion = st.multiselect("Productos del pedido", list(nombres), format_func=nombres.__getitem__, key="productos_pedido")
+    with st.form("formulario_pedido"):
+        tercero = st.text_input("Proveedor" if tipo == "entrada" else "Cliente", key=f"tercero_{tipo}")
+        fecha_movimiento = st.date_input("Fecha del movimiento", value=date.today())
+        items = {
+            id_producto: st.number_input(
+                f"Cantidad de {nombres[id_producto]}", min_value=1, step=1,
+                value=1, key=f"cantidad_pedido_{id_producto}",
+            )
+            for id_producto in seleccion
+        }
+        observacion = st.text_input("Observación (opcional)")
+        enviar = st.form_submit_button("Confirmar pedido", disabled=not seleccion)
     if enviar:
-        id_producto = opciones[nombre_producto]
-        fecha_texto = fecha_movimiento.isoformat()
-        if tipo_operacion == "entrada":
-            ok, mensaje = registrar_entrada(id_producto, int(cantidad), "entrada", fecha_texto, observacion)
-        else:
-            ok, mensaje = registrar_salida(id_producto, int(cantidad), "salida", fecha_texto, observacion)
-        (st.success if ok else st.error)(mensaje)
+        ok, mensaje = registrar_pedido(tipo, tercero, items, fecha_movimiento.isoformat(), observacion)
         if ok:
+            st.session_state["pedido_guardado"] = mensaje
             st.rerun()
+        st.error(mensaje)
+
+    with st.expander("Consultar pedidos registrados"):
+        historial = leer("""
+            SELECT p.id_pedido AS Pedido, m.fecha AS Fecha,
+                   CASE m.tipo WHEN 'entrada' THEN 'Compra recibida' ELSE 'Despacho' END AS Tipo,
+                   p.tercero AS 'Proveedor o cliente', pr.nombre AS Producto,
+                   m.cantidad AS Cantidad, pr.unidad_medida AS Unidad
+            FROM pedidos p
+            JOIN movimientos_pedido mp USING (id_pedido)
+            JOIN movimientos m USING (id_movimiento)
+            JOIN productos pr USING (id_producto)
+            ORDER BY p.id_pedido DESC, m.id_movimiento
+        """)
+        if historial.empty:
+            st.info("Aún no hay pedidos registrados.")
+        else:
+            st.dataframe(historial, hide_index=True)
 
 with tab_inventario:
     st.subheader("Inventario actual")
